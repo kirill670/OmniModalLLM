@@ -1,7 +1,3 @@
-Here is a `README.md` file for your code, explaining its purpose, setup, architecture, and usage.
-
----
-
 # OmniModalLLM: An Omnimodal Large Language Model for Text and Image Data
 
 OmniModalLLM is a PyTorch-based model designed to process and generate responses from multimodal inputs, specifically combining text and image data. It incorporates advanced techniques like adaptive configuration, mixture of experts, and dynamic layers to produce an adaptable and efficient architecture. This model is suitable for tasks that require handling both text and image data simultaneously, and it includes a FastAPI server for real-time inference.
