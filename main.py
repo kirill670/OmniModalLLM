@@ -6,8 +6,8 @@
 # They ensure the correct versions of PyTorch and other dependencies are installed.
 
 # !pip install torch torchvision torchaudio --extra-index-url https://download.pytorch.org/whl/cu116
-# !pip install transformers datasets pillow gradio fastapi uvicorn tiktoken einops tensorboard
-# !pip install faiss-cpu
+# !pip install transformers datasets pillow fastapi uvicorn tiktoken einops tensorboard
+# !pip install faiss-cpu slowapi
 
 # ==========================================
 # Imports and Device Initialization
@@ -27,10 +27,14 @@ from torch.utils.checkpoint import checkpoint
 from torch.utils.tensorboard import SummaryWriter
 from typing import Any, Dict, List, Optional
 import uvicorn
-from fastapi import FastAPI, UploadFile, File, Form
+from fastapi import FastAPI, UploadFile, File, Form, Request
 from pydantic import BaseModel
 import io
 from tqdm import tqdm
+import uuid
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 
 # Attempt to import torch_xla for TPU support
 try:
@@ -557,7 +561,7 @@ class LFModel(nn.Module):
                 ),
                 'attention': LongformerModel.from_pretrained('allenai/longformer-base-4096'),
                 'combiner': ComponentCombination(
-                    input_dims=[token_dim, channel_dim, expert_dim, token_dim],
+                    input_dims=[token_dim, channel_dim, expert_dim, 512],  # 512 for Longformer hidden size
                     hidden_dim=hidden_dim,
                     dropout_rate=dropout_rate,
                     activation=combination_activation,
@@ -568,7 +572,7 @@ class LFModel(nn.Module):
             self.layers.append(layer)
         
         self.dynamic_layer_threshold = dynamic_layer_threshold
-        self.output_layer = nn.Linear(sum([token_dim, channel_dim, expert_dim, token_dim]), token_dim)
+        self.output_layer = nn.Linear(sum([token_dim, channel_dim, expert_dim, 512]), token_dim)
         self.output_layer.apply(initialize_weights)
 
     def forward(self, x: torch.Tensor, config_weights: Optional[Dict[str, float]] = None) -> torch.Tensor:
@@ -702,17 +706,21 @@ class OmniModalLLM(nn.Module):
         # Initialize Adaptive Configuration
         self.adaptive_config = AdaptiveConfiguration(adapt_dim).to(device)
         # Token predictor to generate logits over vocabulary
-        self.token_predictor = nn.Linear(512, self.lf_model.layers[0]['attention'].config.vocab_size).to(device)  # Standard vocab size for Longformer
+        self.token_predictor = nn.Linear(512, 30522).to(device)  # Standard vocab size for Longformer
         self.token_predictor.apply(initialize_weights)
 
-    def forward(self, text_embeddings: torch.Tensor, image_embeddings: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(self, text_embeddings: torch.Tensor, image_embeddings: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
         """Forward pass through the OmniModalLLM."""
-        # Concatenate text and image embeddings along the sequence dimension
-        combined_input = torch.cat([text_embeddings, image_embeddings], dim=1)  # [batch, seq+img_seq, embed_dim]
-        # Generate adaptive input by averaging over the sequence dimension
-        adapt_input = combined_input.mean(dim=1)  # [batch, adapt_dim]
+        # Concatenate text and image embeddings along sequence dimension if image is provided
+        if image_embeddings is not None:
+            combined_input = torch.cat([text_embeddings, image_embeddings], dim=1)  # [batch, seq+img_seq, embed_dim]
+        else:
+            combined_input = text_embeddings  # [batch, seq, embed_dim]
+        
+        # Generate adaptive input by averaging over sequence dimension
+        adapt_input = self.lf_model.featurizer(combined_input.mean(dim=1))  # [batch, adapt_dim]
         # Generate adaptive configuration weights
-        config = self.adaptive_config(self.lf_model.featurizer(adapt_input))
+        config = self.adaptive_config(adapt_input)
         # Create config_weights dictionary for LFModel
         config_weights = {f"layer_{i+1}": weight.item() for i, weight in enumerate([
             config['moe_weight'], 
@@ -722,9 +730,12 @@ class OmniModalLLM(nn.Module):
         ])}
         # Pass through LFModel
         output = self.lf_model(combined_input, config_weights)  # [batch, total_seq, token_dim]
-        # Split output into text and image parts
-        seq_length = text_embeddings.shape[1]
-        text_output = output[:, :seq_length, :]  # [batch, seq, token_dim]
+        # Split output into text and image parts if image is provided
+        if image_embeddings is not None:
+            seq_length = text_embeddings.shape[1]
+            text_output = output[:, :seq_length, :]  # [batch, seq, token_dim]
+        else:
+            text_output = output  # [batch, seq, token_dim]
         # Compute mean of text output for VAE
         text_mean = text_output.mean(dim=1)  # [batch, token_dim]
         # Pass through LiquidVAE
@@ -734,8 +745,11 @@ class OmniModalLLM(nn.Module):
         token_logits = self.token_predictor(reconstructed_text)  # [batch, vocab_size]
         # Reconstruct full text using VAE decoder
         reconstructed_text_full = self.liquid_vae.decoder(vae_outputs["reconstructed"], adapt_input)  # [batch, input_dim]
-        # Concatenate reconstructed text with image outputs
-        combined_output = torch.cat([reconstructed_text_full.unsqueeze(1), output[:, seq_length:, :]], dim=1)  # [batch, total_seq, token_dim]
+        # Concatenate reconstructed text with image outputs if image is provided
+        if image_embeddings is not None:
+            combined_output = torch.cat([reconstructed_text_full.unsqueeze(1), output[:, seq_length:, :]], dim=1)  # [batch, total_seq, token_dim]
+        else:
+            combined_output = reconstructed_text_full  # [batch, input_dim]
         return {
             "output": combined_output,
             "token_logits": token_logits,
@@ -865,7 +879,8 @@ def train_model(model, dataloader, optimizer, criterion, scheduler, device, num_
             
             # Clear cache to free memory
             del loss, loss_tokens, loss_vae, outputs
-            torch.cuda.empty_cache()
+            if device.type == 'cuda':
+                torch.cuda.empty_cache()
 
         avg_loss = epoch_loss / len(dataloader)
         print(f"Average Loss: {avg_loss:.4f}")
@@ -897,9 +912,17 @@ def train_model(model, dataloader, optimizer, criterion, scheduler, device, num_
 # API Models
 # ==========================================
 
-class InferenceRequest(BaseModel):
-    """Model for inference request."""
-    text: str
+class ChatMessage(BaseModel):
+    role: str  # 'user', 'assistant', or 'system'
+    content: str
+
+class ChatRequest(BaseModel):
+    session_id: Optional[str] = None  # To manage conversation sessions
+    messages: List[ChatMessage]
+
+class ChatResponse(BaseModel):
+    session_id: str
+    message: ChatMessage
 
 # ==========================================
 # FastAPI Setup
@@ -907,18 +930,23 @@ class InferenceRequest(BaseModel):
 
 app = FastAPI()
 
+# Initialize Limiter for Rate Limiting
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
 # ==========================================
 # Initialize Model and Tokenizer
 # ==========================================
 
 def initialize_model(device: str = 'cpu') -> (OmniModalLLM, LiquidFoundationTokenizer):
-    """Initialize the OmniModalLLM and tokenizer."""
+    """Initialize the OmniModalLLM and tokenizer with optimized settings."""
     token_dim = 512
     channel_dim = 512
-    expert_dim = 512
-    adapt_dim = 256
-    num_experts = 4  # Reduced number of experts to save memory
-    num_layers = 3   # Reduced number of layers to save memory
+    expert_dim = 256  # Reduced from 512 to save memory
+    adapt_dim = 128    # Reduced from 256 to save memory
+    num_experts = 4    # Reduced from 8 to save memory
+    num_layers = 3     # Reduced from 6 to save memory
     hidden_dim = 64
     num_heads = 8
 
@@ -946,47 +974,98 @@ def initialize_model(device: str = 'cpu') -> (OmniModalLLM, LiquidFoundationToke
 
 # Initialize device as per earlier selection
 model, tokenizer = initialize_model(device=device)
+# Load pre-trained weights if available
+# model.load_model('path_to_checkpoint.pth.tar')
+
+# ==========================================
+# Conversation History Storage
+# ==========================================
+
+# Simple in-memory storage for session histories
+conversation_history = {}
 
 # ==========================================
 # Inference Function
 # ==========================================
 
-def generate_response(model: OmniModalLLM, tokenizer: LiquidFoundationTokenizer, text: str, image: Image.Image) -> str:
-    """Generate response from the model based on input text and image."""
+def generate_response(model: OmniModalLLM, tokenizer: LiquidFoundationTokenizer, user_text: str, session_id: str) -> str:
+    """Generate assistant response based on user input and conversation history."""
     model.eval()
     with torch.no_grad():
-        # Tokenize text
-        text_emb = tokenizer.text_tokenizer.tokenize(text).to(device)  # [1, seq, embed_dim]
-        # Tokenize image
-        image_emb = tokenizer.image_tokenizer.tokenize(image).to(device)  # [1, img_seq, embed_dim]
-        # Pass through model
-        outputs = model(text_emb, image_emb)
+        # Retrieve conversation history for the session
+        history = conversation_history.get(session_id, [])
+        
+        # Concatenate all user and assistant messages
+        conversation = ""
+        for msg in history:
+            if msg.role == 'user':
+                conversation += f"User: {msg.content}\n"
+            elif msg.role == 'assistant':
+                conversation += f"Assistant: {msg.content}\n"
+        
+        # Append the latest user message
+        conversation += f"User: {user_text}\nAssistant:"
+        
+        # Tokenize the conversation
+        text_emb = tokenizer.text_tokenizer.tokenize(conversation).to(device)  # [1, seq, embed_dim]
+        
+        # Pass through the model
+        outputs = model(text_emb, image_embeddings=None)  # Assuming text-only for chat
         token_logits = outputs["token_logits"]  # [1, vocab_size]
-        # Get predicted token
-        predictions = torch.argmax(token_logits, dim=-1)  # [1]
-        # Detokenize to get response text
-        response_text = tokenizer.text_tokenizer.detokenize(predictions.unsqueeze(0))
-    return response_text
+        
+        # Generate the assistant's response token
+        predicted_token_id = torch.argmax(token_logits, dim=-1)  # [1]
+        
+        # Detokenize to get the response text
+        response_text = tokenizer.text_tokenizer.detokenize(predicted_token_id.unsqueeze(0))
+        
+    return response_text.strip()
 
 # ==========================================
 # API Endpoint
 # ==========================================
 
-@app.post("/generate/")
-async def generate(
-    text: str = Form(...),
-    image: UploadFile = File(...)
-):
-    """API endpoint to generate response based on text and image."""
-    try:
-        # Read and process image
-        image_bytes = await image.read()
-        image = Image.open(io.BytesIO(image_bytes)).convert('RGB')
-        # Generate response
-        response = generate_response(model, tokenizer, text, image)
-        return {"response": response}
-    except Exception as e:
-        return {"error": str(e)}
+@app.post("/chat/", response_model=ChatResponse)
+@limiter.limit("20/minute")  # Limit to 20 requests per minute per IP
+async def chat_endpoint(request: ChatRequest, req: Request):
+    """API endpoint to generate response based on chat messages."""
+    # Generate a new session_id if not provided
+    if not request.session_id:
+        session_id = str(uuid.uuid4())
+        conversation_history[session_id] = []
+    else:
+        session_id = request.session_id
+        if session_id not in conversation_history:
+            conversation_history[session_id] = []
+    
+    # Append incoming messages to the conversation history
+    conversation_history[session_id].extend(request.messages)
+    
+    # Extract the latest user message
+    user_message = next((msg for msg in request.messages if msg.role == 'user'), None)
+    if not user_message:
+        return ChatResponse(
+            session_id=session_id,
+            message=ChatMessage(role="assistant", content="I didn't receive any user message.")
+        )
+    
+    # Generate assistant's response
+    assistant_reply = generate_response(
+        model, 
+        tokenizer, 
+        user_message.content, 
+        session_id=session_id
+    )
+    
+    # Append assistant's reply to the conversation history
+    conversation_history[session_id].append(
+        ChatMessage(role="assistant", content=assistant_reply)
+    )
+    
+    return ChatResponse(
+        session_id=session_id,
+        message=ChatMessage(role="assistant", content=assistant_reply)
+    )
 
 # ==========================================
 # Main Function to Train and Launch API
@@ -1007,12 +1086,12 @@ def main():
     # Create custom dataset
     coco_dataset = CocoDataset(dataset, tokenizer.text_tokenizer, transform)
     # Determine batch size based on device
-    if device.type == 'xla':
-        batch_size = 2  # Reduced batch size for TPU
-    elif device.type == 'cuda':
-        batch_size = 8  # Standard batch size for GPU
+    if device.type == 'cuda':
+        batch_size = 4  # Reduced from 8 to save memory
+    elif device.type == 'xla':
+        batch_size = 2  # Reduced for TPU
     else:
-        batch_size = 4  # Standard batch size for CPU
+        batch_size = 2  # Reduced for CPU
     # Create DataLoader with adjusted batch size
     dataloader = DataLoader(coco_dataset, batch_size=batch_size, shuffle=True, num_workers=2)
 
@@ -1023,7 +1102,7 @@ def main():
 
     # Training
     print("Starting training...")
-    train_model(model, dataloader, optimizer, criterion, scheduler, device, num_epochs=5, save_path='omnimodal_llm.pth.tar', patience=3)
+    train_model(model, dataloader, optimizer, criterion, scheduler, device, num_epochs=5, save_path='checkpoint.pth.tar', patience=3)
     print("Training completed.")
 
     # Launch API with Uvicorn
@@ -1037,7 +1116,14 @@ def main():
     api_thread = threading.Thread(target=run_api, daemon=True)
     api_thread.start()
 
-    print("API server is running. You can send requests to /generate/.")
+    print("API server is running. You can send requests to /chat/.")
+
+    # Keep the main thread alive to allow the API to run
+    try:
+        while True:
+            pass
+    except KeyboardInterrupt:
+        print("Shutting down.")
 
 if __name__ == "__main__":
     main()
