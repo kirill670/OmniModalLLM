@@ -1,23 +1,4 @@
 # ==========================================
-# Installation Commands
-# ==========================================
-
-# Убедитесь, что вы запускаете эти команды в среде, поддерживающей TPU, например, Google Colab.
-# Эти команды устанавливают совместимые версии PyTorch и torch_xla для TPU.
-
-# Удаление существующих установок PyTorch, torchvision, torchaudio и torch_xla
-!pip uninstall -y torch torchvision torchaudio torch-xla
-
-# Установка PyTorch, torchvision и torchaudio версии 1.12.0
-!pip install torch==1.12.0 torchvision==0.13.0 torchaudio==0.12.0
-
-# Установка torch_xla версии 1.12.0 для TPU VM
-!pip install torch-xla==1.12 -f https://storage.googleapis.com/tpu-pytorch/wheels/tpuvm/torch_xla-1.12-cp310-cp310-linux_x86_64.whl
-
-# Установка остальных необходимых библиотек
-!pip install transformers datasets pillow gradio fastapi uvicorn tiktoken einops tensorboard faiss-cpu tqdm
-
-# ==========================================
 # Imports
 # ==========================================
 
