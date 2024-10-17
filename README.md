@@ -25,7 +25,7 @@ OmniModalLLM is a PyTorch-based model designed to process and generate responses
 1. **Clone the repository**:
 
    ```bash
-   git clone https://github.com/yourusername/OmniModalLLM.git
+   git clone https://github.com/kirill670/OmniModalLLM.git
    cd OmniModalLLM
    ```
 
