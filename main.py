@@ -811,11 +811,11 @@ class VQVAE(nn.Module):
         return z_q, vq_loss, perplexity
 
 # ==========================================
-# Dataset Class for MS COCO
+# Dataset Classes for Flickr30k and DailyDialog
 # ==========================================
 
-class CocoDataset(Dataset):
-    """Custom Dataset for MS COCO with text and image."""
+class FlickrDataset(Dataset):
+    """Custom Dataset for Flickr30k with text and image."""
     def __init__(self, dataset, tokenizer: TextTokenizer, image_transform):
         self.dataset = dataset
         self.tokenizer = tokenizer
@@ -830,59 +830,130 @@ class CocoDataset(Dataset):
         text = sample['caption']
         image = sample['image']
         text_emb = self.tokenizer.tokenize(text)  # [1, max_length, embed_dim]
-        image_emb = self.image_transform(image)  # [3, 128, 128]
+        image_emb = self.image_transform(image)    # [3, 128, 128]
         return {'text': text_emb.squeeze(0), 'image': image_emb}
+
+class ChatDataset(Dataset):
+    """Custom Dataset for DailyDialog with text."""
+    def __init__(self, dataset, tokenizer: TextTokenizer, max_length: int = 512):
+        self.dataset = dataset
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        """Get a single sample from the dataset."""
+        sample = self.dataset[idx]
+        dialog = sample['dialog']
+        # Concatenate all utterances into a single string
+        conversation = " ".join(dialog)
+        # Tokenize the conversation
+        tokens = self.tokenizer.tokenize(conversation, max_length=self.max_length)
+        return {'text': tokens.squeeze(0)}
 
 # ==========================================
 # Training Function
 # ==========================================
 
-def train_model(model, dataloader, optimizer, criterion, scheduler, device, num_epochs=1, save_path='checkpoint.pth.tar', patience=3):
-    """Training loop with mixed precision and gradient checkpointing."""
-    writer = SummaryWriter()
-    scaler = GradScaler()
-    best_loss = float('inf')
-    epochs_no_improve = 0
+def train_model(
+    model,
+    flickr_dataloader,
+    chat_dataloader,
+    optimizer,
+    criterion,
+    scheduler,
+    device,
+    num_epochs=5,
+    save_path='checkpoint.pth.tar',
+    patience=3
+):
+    """
+    Training loop handling both Flickr30k and DailyDialog datasets.
 
-    model.train()
+    Args:
+        model (nn.Module): The multimodal model to train.
+        flickr_dataloader (DataLoader): DataLoader for the Flickr30k dataset.
+        chat_dataloader (DataLoader): DataLoader for the DailyDialog dataset.
+        optimizer (torch.optim.Optimizer): Optimizer for training.
+        criterion (nn.Module): Loss function.
+        scheduler (torch.optim.lr_scheduler._LRScheduler): Learning rate scheduler.
+        device (torch.device): Device to train on.
+        num_epochs (int): Number of training epochs.
+        save_path (str): Path to save the best model checkpoint.
+        patience (int): Number of epochs with no improvement after which training stops.
+    """
+    writer = SummaryWriter()  # TensorBoard writer for monitoring
+    scaler = GradScaler()      # For mixed precision training
+    best_loss = float('inf')  # Initialize best loss
+    epochs_no_improve = 0     # Counter for early stopping
+    
+    model.train()  # Set model to training mode
     for epoch in range(num_epochs):
-        print(f"Epoch {epoch+1}/{num_epochs}")
-        epoch_loss = 0.0
-        for batch in tqdm(dataloader, desc="Training"):
-            text_embeddings = batch['text'].to(device)  # [batch, seq, embed_dim]
-            image_embeddings = batch['image'].to(device)  # [batch, 3, 128, 128]
-            optimizer.zero_grad()
-            with autocast():
-                # Forward pass through the model
-                outputs = model(text_embeddings, image_embeddings)
-                token_logits = outputs["token_logits"]  # [batch, vocab_size]
+        print(f"Epoch {epoch + 1}/{num_epochs}")
+        epoch_loss = 0.0  # Cumulative loss for the epoch
+        
+        # Create iterators for both dataloaders
+        flickr_iter = iter(flickr_dataloader)
+        chat_iter = iter(chat_dataloader)
+        
+        # Determine the number of batches (use the smaller size to prevent StopIteration)
+        num_batches = min(len(flickr_dataloader), len(chat_dataloader))
+        
+        for _ in tqdm(range(num_batches), desc="Training"):
+            try:
+                # Get the next batch from each dataloader
+                flickr_batch = next(flickr_iter)
+                chat_batch = next(chat_iter)
+            except StopIteration:
+                # In case one dataloader is exhausted before the other
+                break
+            
+            # Move data to the appropriate device
+            text_embeddings_flickr = flickr_batch['text'].to(device)      # [batch, seq, embed_dim]
+            image_embeddings_flickr = flickr_batch['image'].to(device)    # [batch, 3, 128, 128]
+            text_embeddings_chat = chat_batch['text'].to(device)          # [batch, max_length]
+            
+            optimizer.zero_grad()  # Reset gradients
+            
+            with autocast():  # Enables mixed precision
+                # Forward pass for Flickr30k
+                outputs_flickr = model(text_embeddings_flickr, image_embeddings_flickr)
+                token_logits_flickr = outputs_flickr["token_logits"]  # [batch, vocab_size]
                 
-                # Prepare labels: Assuming the labels are the next tokens in the sequence
-                # Here, for simplicity, we're using the argmax of text embeddings as labels
-                # In practice, you should have actual target token IDs
-                labels = text_embeddings[:, 1:, :].argmax(dim=-1).reshape(-1)  # [batch*(seq-1)]
-                token_logits = token_logits.reshape(-1, model.token_predictor.out_features)  # [batch*(seq-1), vocab_size]
-                loss_tokens = criterion(token_logits, labels)
+                # Prepare labels for Flickr30k
+                # Assuming labels are the next tokens in the sequence
+                labels_flickr = text_embeddings_flickr[:, 1:, :].argmax(dim=-1).reshape(-1)  # [batch*(seq-1)]
+                token_logits_flickr = token_logits_flickr.reshape(-1, model.token_predictor.out_features)  # [batch*(seq-1), vocab_size]
+                loss_tokens_flickr = criterion(token_logits_flickr, labels_flickr)
                 
-                # VAE loss
-                vae_recon = outputs["vae_reconstructed"]  # [batch, token_dim]
-                vae_mu = outputs["vae_mu"]
-                vae_logvar = outputs["vae_logvar"]
-                loss_vae = model.liquid_vae.loss_function(vae_recon, text_embeddings.mean(dim=1), vae_mu, vae_logvar)
+                # Forward pass for DailyDialog
+                outputs_chat = model(text_embeddings_chat, image_embeddings=None)  # Chat data may not have images
+                token_logits_chat = outputs_chat["token_logits"]  # [batch, vocab_size]
                 
-                # Total loss
-                loss = loss_tokens + loss_vae
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-            epoch_loss += loss.item()
+                # Prepare labels for DailyDialog
+                labels_chat = text_embeddings_chat[:, 1:].reshape(-1)  # [batch*(max_length-1)]
+                token_logits_chat = token_logits_chat.reshape(-1, model.token_predictor.out_features)  # [batch*(max_length-1), vocab_size]
+                loss_tokens_chat = criterion(token_logits_chat, labels_chat)
+                
+                # Total loss is the sum of both losses
+                loss = loss_tokens_flickr + loss_tokens_chat
+            
+            # Backward pass and optimization
+            scaler.scale(loss).backward()  # Scales the loss for mixed precision
+            scaler.step(optimizer)         # Updates the weights
+            scaler.update()                # Updates the scale for next iteration
+            
+            epoch_loss += loss.item()  # Accumulate loss
             
             # Clear cache to free memory
-            del loss, loss_tokens, loss_vae, outputs
+            del loss, loss_tokens_flickr, loss_tokens_chat, outputs_flickr, outputs_chat
             if device.type == 'cuda':
                 torch.cuda.empty_cache()
-
-        avg_loss = epoch_loss / len(dataloader)
+        
+        # Calculate average loss for the epoch
+        avg_loss = epoch_loss / num_batches
         print(f"Average Loss: {avg_loss:.4f}")
         writer.add_scalar('Loss/train', avg_loss, epoch)
         
@@ -890,30 +961,32 @@ def train_model(model, dataloader, optimizer, criterion, scheduler, device, num_
         if avg_loss < best_loss:
             best_loss = avg_loss
             epochs_no_improve = 0
+            # Save the best model checkpoint
             save_checkpoint({
                 'epoch': epoch + 1,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'loss': avg_loss,
             }, filename=save_path)
-            print(f"Checkpoint saved at epoch {epoch+1}")
+            print(f"Checkpoint saved at epoch {epoch + 1}")
         else:
             epochs_no_improve += 1
             if epochs_no_improve >= patience:
                 print("Early stopping triggered!")
                 break
         
-        # Step the scheduler
+        # Step the scheduler based on the average loss
         scheduler.step(avg_loss)
         writer.add_scalar('Learning Rate', optimizer.param_groups[0]['lr'], epoch)
-    writer.close()
+    
+    writer.close()  # Close the TensorBoard writer
 
 # ==========================================
 # API Models
 # ==========================================
 
 class ChatMessage(BaseModel):
-    role: str  # 'user', 'assistant', or 'system'
+    role: str  # 'user' or 'assistant'
     content: str
 
 class ChatRequest(BaseModel):
@@ -939,18 +1012,30 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 # Initialize Model and Tokenizer
 # ==========================================
 
-def initialize_model(device: str = 'cpu') -> (OmniModalLLM, LiquidFoundationTokenizer):
-    """Initialize the OmniModalLLM and tokenizer with optimized settings."""
+def initialize_model_and_tokenizer(device: torch.device):
+    """
+    Initializes the OmniModalLLM model and the LiquidFoundationTokenizer.
+
+    Args:
+        device (torch.device): The device to load the model onto.
+
+    Returns:
+        model (OmniModalLLM): The multimodal model.
+        tokenizer (LiquidFoundationTokenizer): The tokenizer for processing text and images.
+    """
     token_dim = 512
     channel_dim = 512
-    expert_dim = 256  # Reduced from 512 to save memory
-    adapt_dim = 128    # Reduced from 256 to save memory
-    num_experts = 4    # Reduced from 8 to save memory
-    num_layers = 3     # Reduced from 6 to save memory
+    expert_dim = 256    # Reduced from 512 to save memory
+    adapt_dim = 128     # Reduced from 256 to save memory
+    num_experts = 4     # Reduced from 8 to save memory
+    num_layers = 3      # Reduced from 6 to save memory
     hidden_dim = 64
     num_heads = 8
-
+    
+    # Initialize the tokenizer
     tokenizer = LiquidFoundationTokenizer(device=device, adapt_dim=adapt_dim)
+    
+    # Initialize the model
     model = OmniModalLLM(
         token_dim=token_dim,
         channel_dim=channel_dim,
@@ -970,11 +1055,13 @@ def initialize_model(device: str = 'cpu') -> (OmniModalLLM, LiquidFoundationToke
         norm_type='batchnorm',
         dynamic_layer_threshold=0.5
     ).to(device)
+    
     return model, tokenizer
 
-# Initialize device as per earlier selection
-model, tokenizer = initialize_model(device=device)
-# Load pre-trained weights if available
+# Initialize model and tokenizer
+model, tokenizer = initialize_model_and_tokenizer(device=device)
+
+# Optionally, load pre-trained weights if available
 # model.load_model('path_to_checkpoint.pth.tar')
 
 # ==========================================
@@ -988,9 +1075,25 @@ conversation_history = {}
 # Inference Function
 # ==========================================
 
-def generate_response(model: OmniModalLLM, tokenizer: LiquidFoundationTokenizer, user_text: str, session_id: str) -> str:
-    """Generate assistant response based on user input and conversation history."""
-    model.eval()
+def generate_response(
+    model: OmniModalLLM,
+    tokenizer: LiquidFoundationTokenizer,
+    user_text: str,
+    session_id: str
+) -> str:
+    """
+    Generates a response from the assistant based on user input and conversation history.
+
+    Args:
+        model (OmniModalLLM): The trained multimodal model.
+        tokenizer (LiquidFoundationTokenizer): Tokenizer for processing text and images.
+        user_text (str): The latest message from the user.
+        session_id (str): Identifier for the conversation session.
+
+    Returns:
+        response_text (str): The assistant's generated response.
+    """
+    model.eval()  # Set model to evaluation mode
     with torch.no_grad():
         # Retrieve conversation history for the session
         history = conversation_history.get(session_id, [])
@@ -1009,7 +1112,7 @@ def generate_response(model: OmniModalLLM, tokenizer: LiquidFoundationTokenizer,
         # Tokenize the conversation
         text_emb = tokenizer.text_tokenizer.tokenize(conversation).to(device)  # [1, seq, embed_dim]
         
-        # Pass through the model
+        # Forward pass through the model
         outputs = model(text_emb, image_embeddings=None)  # Assuming text-only for chat
         token_logits = outputs["token_logits"]  # [1, vocab_size]
         
@@ -1028,7 +1131,16 @@ def generate_response(model: OmniModalLLM, tokenizer: LiquidFoundationTokenizer,
 @app.post("/chat/", response_model=ChatResponse)
 @limiter.limit("20/minute")  # Limit to 20 requests per minute per IP
 async def chat_endpoint(request: ChatRequest, req: Request):
-    """API endpoint to generate response based on chat messages."""
+    """
+    API endpoint to handle chat messages and generate responses.
+
+    Args:
+        request (ChatRequest): Incoming chat request containing messages and optional session_id.
+        req (Request): The incoming HTTP request (used for rate limiting).
+
+    Returns:
+        ChatResponse: The assistant's response along with the session_id.
+    """
     # Generate a new session_id if not provided
     if not request.session_id:
         session_id = str(uuid.uuid4())
@@ -1072,52 +1184,88 @@ async def chat_endpoint(request: ChatRequest, req: Request):
 # ==========================================
 
 def main():
-    """Main function to train the model and launch the API server."""
+    """
+    Main function to train the model and launch the API server.
+    """
+    # ==========================================
     # Data Loading and Preparation
-    print("Loading MS COCO dataset...")
-    dataset = load_dataset("flickr30k", split='train')
+    # ==========================================
+    
+    # Loading Flickr30k dataset
+    print("Loading Flickr30k dataset...")
+    flickr_dataset = load_dataset("flickr30k", split='train')
     # Filter out samples without captions or images
-    dataset = dataset.filter(lambda x: len(x['caption']) > 0 and x['image'] is not None)
+    flickr_dataset = flickr_dataset.filter(lambda x: len(x['caption']) > 0 and x['image'] is not None)
+    
+    # Loading DailyDialog dataset
+    print("Loading DailyDialog dataset...")
+    chat_dataset = load_dataset("daily_dialog", split='train')
+    
     # Define image transformations
     transform = transforms.Compose([
         transforms.Resize((128, 128)),
         transforms.ToTensor()
     ])
-    # Create custom dataset
-    coco_dataset = CocoDataset(dataset, tokenizer.text_tokenizer, transform)
+    
+    # Create custom Dataset instances
+    flickr_custom_dataset = FlickrDataset(flickr_dataset, tokenizer.text_tokenizer, transform)
+    chat_custom_dataset = ChatDataset(chat_dataset, tokenizer.text_tokenizer, max_length=512)
+    
     # Determine batch size based on device
     if device.type == 'cuda':
-        batch_size = 4  # Reduced from 8 to save memory
+        batch_size = 4  # Reduced to save memory
     elif device.type == 'xla':
         batch_size = 2  # Reduced for TPU
     else:
         batch_size = 2  # Reduced for CPU
-    # Create DataLoader with adjusted batch size
-    dataloader = DataLoader(coco_dataset, batch_size=batch_size, shuffle=True, num_workers=2)
-
+    
+    # Create DataLoaders for both datasets
+    flickr_dataloader = DataLoader(flickr_custom_dataset, batch_size=batch_size, shuffle=True, num_workers=2)
+    chat_dataloader = DataLoader(chat_custom_dataset, batch_size=batch_size, shuffle=True, num_workers=2)
+    
+    # ==========================================
     # Optimizer, Loss, Scheduler
+    # ==========================================
+    
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
     criterion = nn.CrossEntropyLoss()
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2, verbose=True)
-
+    
+    # ==========================================
     # Training
+    # ==========================================
+    
     print("Starting training...")
-    train_model(model, dataloader, optimizer, criterion, scheduler, device, num_epochs=5, save_path='checkpoint.pth.tar', patience=3)
+    train_model(
+        model=model,
+        flickr_dataloader=flickr_dataloader,
+        chat_dataloader=chat_dataloader,
+        optimizer=optimizer,
+        criterion=criterion,
+        scheduler=scheduler,
+        device=device,
+        num_epochs=5,
+        save_path='checkpoint.pth.tar',
+        patience=3
+    )
     print("Training completed.")
-
+    
+    # ==========================================
     # Launch API with Uvicorn
+    # ==========================================
+    
     print("Launching API server...")
     # Run Uvicorn in a separate thread to allow training and API to run simultaneously
     import threading
-
+    
     def run_api():
         uvicorn.run(app, host="0.0.0.0", port=8000)
-
+    
     api_thread = threading.Thread(target=run_api, daemon=True)
     api_thread.start()
-
+    
     print("API server is running. You can send requests to /chat/.")
-
+    
     # Keep the main thread alive to allow the API to run
     try:
         while True:
@@ -1125,5 +1273,10 @@ def main():
     except KeyboardInterrupt:
         print("Shutting down.")
 
+# ==========================================
+# Entry Point
+# ==========================================
+
 if __name__ == "__main__":
+    main()
     main()
