@@ -1,8 +1,25 @@
-# Install necessary libraries
-# Uncomment the following lines if running in a new environment
-# !pip install torch torchvision torchaudio --extra-index-url https://download.pytorch.org/whl/cu116
-# !pip install transformers datasets pillow gradio fastapi uvicorn tiktoken einops tensorboard
-# !pip install faiss-cpu
+# ==========================================
+# Installation Commands
+# ==========================================
+
+# Убедитесь, что вы запускаете эти команды в среде, поддерживающей TPU, например, Google Colab.
+# Эти команды устанавливают совместимые версии PyTorch и torch_xla для TPU.
+
+# Удаление существующих установок PyTorch, torchvision, torchaudio и torch_xla
+!pip uninstall -y torch torchvision torchaudio torch-xla
+
+# Установка PyTorch, torchvision и torchaudio версии 1.12.0
+!pip install torch==1.12.0 torchvision==0.13.0 torchaudio==0.12.0
+
+# Установка torch_xla версии 1.12.0 для TPU VM
+!pip install torch-xla==1.12 -f https://storage.googleapis.com/tpu-pytorch/wheels/tpuvm/torch_xla-1.12-cp310-cp310-linux_x86_64.whl
+
+# Установка остальных необходимых библиотек
+!pip install transformers datasets pillow gradio fastapi uvicorn tiktoken einops tensorboard faiss-cpu tqdm
+
+# ==========================================
+# Imports
+# ==========================================
 
 import os
 import torch
@@ -23,7 +40,23 @@ from pydantic import BaseModel
 import io
 from tqdm import tqdm
 
+# Импорт torch_xla и его модулей
+import torch_xla
+import torch_xla.core.xla_model as xm
+from torch_xla.distributed import parallel_loader
+
+# ==========================================
+# Device Initialization
+# ==========================================
+
+# Инициализация устройства TPU
+device = xm.xla_device()
+print(f"Using device: {device}")
+
+# ==========================================
 # Utility Functions
+# ==========================================
+
 def initialize_weights(module: nn.Module):
     """Initialize weights for linear and normalization layers."""
     if isinstance(module, nn.Linear):
@@ -54,7 +87,10 @@ def load_checkpoint(model, optimizer, filename='checkpoint.pth.tar'):
         print(f"No checkpoint found at '{filename}'")
         return None, None
 
+# ==========================================
 # Regularization Modules
+# ==========================================
+
 class DropPath(nn.Module):
     """Stochastic Depth (DropPath) regularization."""
     def __init__(self, drop_prob: float = 0.0):
@@ -100,7 +136,10 @@ class LayerDrop(nn.Module):
             return x
         return layer(x)
 
+# ==========================================
 # Liquid Layers
+# ==========================================
+
 class LiquidLinear(nn.Module):
     """Dynamic Linear layer with adaptive weights."""
     def __init__(self, in_features: int, out_features: int, adapt_dim: int):
@@ -116,7 +155,10 @@ class LiquidLinear(nn.Module):
         weight = self.base_linear.weight + adapt_weight
         return F.linear(x, weight, self.base_linear.bias)
 
+# ==========================================
 # Vector Quantizer
+# ==========================================
+
 class VectorQuantizer(nn.Module):
     """Vector Quantizer for VQVAE."""
     def __init__(self, num_embeddings: int, embedding_dim: int, commitment_cost: float):
@@ -159,7 +201,10 @@ class VectorQuantizer(nn.Module):
 
         return quantized, loss, perplexity
 
+# ==========================================
 # Variational Autoencoder (VAE) for Text
+# ==========================================
+
 class LiquidVAE(nn.Module):
     """VAE with LiquidLinear layers for text data."""
     def __init__(self, input_dim: int, hidden_dim: int, latent_dim: int, adapt_dim: int):
@@ -201,7 +246,10 @@ class LiquidVAE(nn.Module):
         KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
         return BCE + KLD
 
+# ==========================================
 # Tokenizers
+# ==========================================
+
 class BaseTokenizer(nn.Module):
     """Base tokenizer class."""
     def __init__(self):
@@ -298,7 +346,10 @@ class LiquidFoundationTokenizer(nn.Module):
             data['image'] = self.image_tokenizer.detokenize(tokens['image'])
         return data
 
+# ==========================================
 # Mixture of Experts Components
+# ==========================================
+
 class KolmogorovArnoldExpert(nn.Module):
     """Kolmogorov-Arnold Expert with non-linear activations."""
     def __init__(self, input_dim: int, output_dim: int, hidden_dim: int, activation: str = 'gelu'):
@@ -380,7 +431,10 @@ class MixtureOfExperts(nn.Module):
         output = self.drop_path(output)
         return output
 
+# ==========================================
 # Component Combination
+# ==========================================
+
 class ComponentCombination(nn.Module):
     """Dynamically combines component outputs with learned weights."""
     def __init__(
@@ -454,7 +508,10 @@ class ComponentCombination(nn.Module):
         combined_output += residual
         return combined_output
 
+# ==========================================
 # Main LFModel with Gradient Checkpointing
+# ==========================================
+
 class LFModel(nn.Module):
     """Main model integrating LiquidLinear, MixtureOfExperts, attention, and component combination."""
     def __init__(
@@ -505,6 +562,8 @@ class LFModel(nn.Module):
                 ),
                 'layerdrop': LayerDrop(layerdrop_prob)
             })
+            # Move LongformerModel to device
+            layer['attention'].to(device)
             self.layers.append(layer)
         
         self.dynamic_layer_threshold = dynamic_layer_threshold
@@ -523,7 +582,7 @@ class LFModel(nn.Module):
             if layer_weight < self.dynamic_layer_threshold:
                 continue
             # Apply LayerDrop with gradient checkpointing
-            x = layer['layerdrop'](x, lambda x: self._process_layer(layer, x, adapt_input))
+            x = layer['layerdrop'](x, lambda x_inner: self._process_layer(layer, x_inner, adapt_input))
         # Apply DropBlock regularization
         x = self.dropblock(x)
         # Final output layer
@@ -547,7 +606,10 @@ class LFModel(nn.Module):
             return combined_output
         return checkpoint(custom_forward, x, adapt_input)
 
+# ==========================================
 # Adaptive Configuration with Reflection Tuning
+# ==========================================
+
 class AdaptiveConfiguration(nn.Module):
     """Generates adaptive configuration weights with reflection tuning."""
     def __init__(self, adapt_dim: int):
@@ -587,7 +649,10 @@ class AdaptiveConfiguration(nn.Module):
             'attention_weight': adjusted_config[:, 3].unsqueeze(-1)
         }
 
+# ==========================================
 # Omnimodal LLM integrating all components
+# ==========================================
+
 class OmniModalLLM(nn.Module):
     """Omnimodal LLM handling text and image data with integrated token prediction."""
     def __init__(
@@ -630,13 +695,13 @@ class OmniModalLLM(nn.Module):
             combination_norm_type=combination_norm_type,
             norm_type=norm_type,
             dynamic_layer_threshold=dynamic_layer_threshold
-        )
+        ).to(device)
         # Initialize LiquidVAE
-        self.liquid_vae = LiquidVAE(input_dim=512, hidden_dim=256, latent_dim=128, adapt_dim=adapt_dim)
+        self.liquid_vae = LiquidVAE(input_dim=512, hidden_dim=256, latent_dim=128, adapt_dim=adapt_dim).to(device)
         # Initialize Adaptive Configuration
-        self.adaptive_config = AdaptiveConfiguration(adapt_dim)
+        self.adaptive_config = AdaptiveConfiguration(adapt_dim).to(device)
         # Token predictor to generate logits over vocabulary
-        self.token_predictor = nn.Linear(512, self.lf_model.layers[0]['attention'].config.vocab_size)
+        self.token_predictor = nn.Linear(512, self.lf_model.layers[0]['attention'].config.vocab_size).to(device)
         self.token_predictor.apply(initialize_weights)
 
     def forward(self, text_embeddings: torch.Tensor, image_embeddings: torch.Tensor) -> Dict[str, torch.Tensor]:
@@ -685,11 +750,14 @@ class OmniModalLLM(nn.Module):
 
     def load_model(self, path: str):
         """Load the model state."""
-        self.load_state_dict(torch.load(path, map_location=self.device))
-        self.to(self.device)
+        self.load_state_dict(torch.load(path, map_location=device))
+        self.to(device)
         print(f"Model loaded from {path}")
 
+# ==========================================
 # Vector Quantized VAE (VQVAE) Implementation
+# ==========================================
+
 class VQVAE(nn.Module):
     """Vector Quantized Variational Autoencoder (VQVAE) for image tokenization."""
     def __init__(self, num_embeddings: int = 512, embedding_dim: int = 64, commitment_cost: float = 0.25):
@@ -727,7 +795,10 @@ class VQVAE(nn.Module):
         x_recon = self.decoder(z_q)  # Reconstruct input
         return z_q, vq_loss, perplexity
 
+# ==========================================
 # Dataset Class
+# ==========================================
+
 class CocoDataset(Dataset):
     """Custom Dataset for MS COCO with text and image."""
     def __init__(self, dataset, tokenizer: TextTokenizer, image_transform):
@@ -747,7 +818,10 @@ class CocoDataset(Dataset):
         image_emb = self.image_transform(image)  # [3, 128, 128]
         return {'text': text_emb.squeeze(0), 'image': image_emb}
 
+# ==========================================
 # Training Function
+# ==========================================
+
 def train_model(model, dataloader, optimizer, criterion, scheduler, device, num_epochs=1, save_path='omnimodal_llm.pth', patience=3):
     """Training loop with mixed precision and gradient checkpointing."""
     writer = SummaryWriter()
@@ -759,16 +833,11 @@ def train_model(model, dataloader, optimizer, criterion, scheduler, device, num_
     for epoch in range(num_epochs):
         print(f"Epoch {epoch+1}/{num_epochs}")
         epoch_loss = 0.0
-        for batch in tqdm(dataloader, desc="Training"):
+        # Использование ParallelLoader для эффективной загрузки данных на TPU
+        para_loader = parallel_loader.MpDeviceLoader(dataloader, device)
+        for batch in tqdm(para_loader, desc="Training"):
             text_embeddings = batch['text'].to(device)  # [batch, seq, embed_dim]
             image_embeddings = batch['image'].to(device)  # [batch, 3, 128, 128]
-            # Tokenize image
-            image_tokens = model.adaptive_config(model.lf_model.featurizer(
-                torch.cat([
-                    text_embeddings.mean(dim=1),
-                    F.adaptive_avg_pool2d(image_embeddings, (1,1)).view(text_embeddings.shape[0], -1)
-                ], dim=1)
-            ))['attention_weight']  # Example usage
             optimizer.zero_grad()
             with autocast():
                 outputs = model(text_embeddings, image_embeddings)
@@ -788,7 +857,7 @@ def train_model(model, dataloader, optimizer, criterion, scheduler, device, num_
             scaler.step(optimizer)
             scaler.update()
             epoch_loss += loss.item()
-        avg_loss = epoch_loss / len(dataloader)
+        avg_loss = epoch_loss / len(para_loader)
         print(f"Average Loss: {avg_loss:.4f}")
         writer.add_scalar('Loss/train', avg_loss, epoch)
         if avg_loss < best_loss:
@@ -809,15 +878,24 @@ def train_model(model, dataloader, optimizer, criterion, scheduler, device, num_
         writer.add_scalar('Learning Rate', optimizer.param_groups[0]['lr'], epoch)
     writer.close()
 
+# ==========================================
 # API Models
+# ==========================================
+
 class InferenceRequest(BaseModel):
     """Model for inference request."""
     text: str
 
+# ==========================================
 # FastAPI Setup
+# ==========================================
+
 app = FastAPI()
 
-# Initialize Model and Tokenizer (Load pre-trained or trained model)
+# ==========================================
+# Initialize Model and Tokenizer
+# ==========================================
+
 def initialize_model(device: str = 'cpu') -> (OmniModalLLM, LiquidFoundationTokenizer):
     """Initialize the OmniModalLLM and tokenizer."""
     token_dim = 512
@@ -848,16 +926,18 @@ def initialize_model(device: str = 'cpu') -> (OmniModalLLM, LiquidFoundationToke
         combination_norm_type='batchnorm',
         norm_type='batchnorm',
         dynamic_layer_threshold=0.5
-    )
-    model.to(device)
+    ).to(device)
     return model, tokenizer
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# Инициализация модели и токенизатора
 model, tokenizer = initialize_model(device=device)
-# Load pre-trained weights if available
+# Загрузка предобученных весов, если доступны
 # model.load_model('path_to_checkpoint.pth.tar')
 
+# ==========================================
 # Inference Function
+# ==========================================
+
 def generate_response(model: OmniModalLLM, tokenizer: LiquidFoundationTokenizer, text: str, image: Image.Image) -> str:
     """Generate response from the model based on input text and image."""
     model.eval()
@@ -868,14 +948,17 @@ def generate_response(model: OmniModalLLM, tokenizer: LiquidFoundationTokenizer,
         image_emb = tokenizer.image_tokenizer.tokenize(image).to(device)  # [1, img_seq, embed_dim]
         # Pass through model
         outputs = model(text_emb, image_emb)
-        token_logits = outputs["token_logits"]  # [1, vocab_size]
+        token_logits = outputs["token_logits"]  # [batch, vocab_size]
         # Get predicted token
         predictions = torch.argmax(token_logits, dim=-1)  # [1]
         # Detokenize to get response text
         response_text = tokenizer.text_tokenizer.detokenize(predictions.unsqueeze(0))
     return response_text
 
+# ==========================================
 # API Endpoint
+# ==========================================
+
 @app.post("/generate/")
 async def generate(
     text: str = Form(...),
@@ -889,7 +972,10 @@ async def generate(
     response = generate_response(model, tokenizer, text, image)
     return {"response": response}
 
+# ==========================================
 # Main Function to Train and Launch API
+# ==========================================
+
 def main():
     """Main function to train the model and launch the API server."""
     # Data Loading and Preparation
@@ -919,6 +1005,7 @@ def main():
 
     # Launch API with Uvicorn
     print("Launching API server...")
+    # Использование Uvicorn с помощью torch_xla для работы на TPU
     uvicorn.run(app, host="0.0.0.0", port=8000)
 
 if __name__ == "__main__":
