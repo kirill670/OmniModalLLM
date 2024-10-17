@@ -21,6 +21,7 @@ import uvicorn
 from fastapi import FastAPI, UploadFile, File, Form
 from pydantic import BaseModel
 import io
+from tqdm import tqdm
 
 # Utility Functions
 def initialize_weights(module: nn.Module):
@@ -109,9 +110,54 @@ class LiquidLinear(nn.Module):
         self.apply(initialize_weights)
 
     def forward(self, x: torch.Tensor, adapt_input: torch.Tensor) -> torch.Tensor:
+        # Generate adaptive weights based on adapt_input
         adapt_weight = self.adapt_linear(adapt_input).view(self.base_linear.weight.size())
+        # Combine base weights with adaptive weights
         weight = self.base_linear.weight + adapt_weight
         return F.linear(x, weight, self.base_linear.bias)
+
+# Vector Quantizer
+class VectorQuantizer(nn.Module):
+    """Vector Quantizer for VQVAE."""
+    def __init__(self, num_embeddings: int, embedding_dim: int, commitment_cost: float):
+        super(VectorQuantizer, self).__init__()
+        self.num_embeddings = num_embeddings
+        self.embedding_dim = embedding_dim
+        self.commitment_cost = commitment_cost
+
+        # Initialize embeddings
+        self.embeddings = nn.Embedding(self.num_embeddings, self.embedding_dim)
+        self.embeddings.weight.data.uniform_(-1/self.num_embeddings, 1/self.num_embeddings)
+
+    def forward(self, z):
+        # Flatten input
+        flat_z = z.view(-1, self.embedding_dim)
+
+        # Compute distances
+        distances = (torch.sum(flat_z**2, dim=1, keepdim=True)
+                     + torch.sum(self.embeddings.weight**2, dim=1)
+                     - 2 * torch.matmul(flat_z, self.embeddings.weight.t()))
+
+        # Encoding
+        encoding_indices = torch.argmin(distances, dim=1).unsqueeze(1)
+        encodings = torch.zeros(encoding_indices.size(0), self.num_embeddings, device=z.device)
+        encodings.scatter_(1, encoding_indices, 1)
+
+        # Quantize
+        quantized = torch.matmul(encodings, self.embeddings.weight).view(z.shape)
+
+        # Loss
+        e_latent_loss = F.mse_loss(quantized.detach(), z)
+        q_latent_loss = F.mse_loss(quantized, z.detach())
+        loss = q_latent_loss + self.commitment_cost * e_latent_loss
+
+        # Straight Through Estimator
+        quantized = z + (quantized - z).detach()
+
+        avg_probs = torch.mean(encodings, dim=0)
+        perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + 1e-10)))
+
+        return quantized, loss, perplexity
 
 # Variational Autoencoder (VAE) for Text
 class LiquidVAE(nn.Module):
@@ -179,6 +225,7 @@ class TextTokenizer(BaseTokenizer):
         self.apply(initialize_weights)
 
     def tokenize(self, text: str, max_length: int = 512) -> torch.Tensor:
+        """Tokenize input text and convert to embeddings."""
         tokens = self.encoder.encode(text, add_special_tokens=True)
         if len(tokens) < max_length:
             tokens += [self.pad_token] * (max_length - len(tokens))
@@ -189,32 +236,35 @@ class TextTokenizer(BaseTokenizer):
         return embeddings
 
     def detokenize(self, tokens: torch.Tensor) -> str:
+        """Convert token embeddings back to text."""
         token_ids = tokens.argmax(dim=-1).cpu().numpy()[0]
         return self.encoder.decode(token_ids, skip_special_tokens=True)
 
 class ImageTokenizer(BaseTokenizer):
     """Tokenizer for image data using VQVAE."""
-    def __init__(self, device: str = 'cpu'):
+    def __init__(self, device: str = 'cpu', num_embeddings: int = 512, embedding_dim: int = 64, commitment_cost: float = 0.25):
         super(ImageTokenizer, self).__init__()
         self.device = device
-        self.vqvae = VQVAE().to(self.device)
+        self.vqvae = VQVAE(num_embeddings=num_embeddings, embedding_dim=embedding_dim, commitment_cost=commitment_cost).to(self.device)
         self.vqvae.eval()
         for param in self.vqvae.parameters():
             param.requires_grad = False
 
     def tokenize(self, image: Image.Image) -> torch.Tensor:
+        """Tokenize image using VQVAE."""
         transform = transforms.Compose([
             transforms.Resize((128, 128)),
             transforms.ToTensor()
         ])
         image_tensor = transform(image).unsqueeze(0).to(self.device)  # [1, 3, 128, 128]
         with torch.no_grad():
-            quantized, _, _ = self.vqvae(image_tensor)  # [1, 64, 32, 32]
-        tokens = quantized.view(1, -1, quantized.shape[1])  # [1, 1024, 64]
+            quantized, _, _ = self.vqvae(image_tensor)  # [1, embedding_dim, 32, 32]
+        tokens = quantized.permute(0, 2, 3, 1).contiguous().view(1, -1, quantized.shape[1])  # [1, 1024, embedding_dim]
         return tokens
 
     def detokenize(self, tokens: torch.Tensor) -> Image.Image:
-        quantized = tokens.view(1, 64, 32, 32)
+        """Reconstruct image from tokens using VQVAE."""
+        quantized = tokens.view(1, tokens.shape[-1], 32, 32)
         with torch.no_grad():
             reconstructed = self.vqvae.decoder(quantized)  # [1, 3, 128, 128]
         reconstructed = reconstructed.squeeze(0).cpu()
@@ -231,6 +281,7 @@ class LiquidFoundationTokenizer(nn.Module):
         self.device = device
 
     def tokenize(self, data: Dict[str, Any]) -> Dict[str, torch.Tensor]:
+        """Tokenize input data containing text and/or image."""
         tokens = {}
         if 'text' in data and data['text'] is not None:
             tokens['text'] = self.text_tokenizer.tokenize(data['text'])
@@ -239,6 +290,7 @@ class LiquidFoundationTokenizer(nn.Module):
         return tokens
 
     def detokenize(self, tokens: Dict[str, torch.Tensor]) -> Dict[str, Any]:
+        """Detokenize tokens back to original data."""
         data = {}
         if 'text' in tokens:
             data['text'] = self.text_tokenizer.detokenize(tokens['text'])
@@ -260,10 +312,12 @@ class KolmogorovArnoldExpert(nn.Module):
         else:
             raise ValueError(f"Unsupported activation: {activation}")
 
+        # Each phi function processes one input dimension
         self.phi_functions = nn.ModuleList([nn.Sequential(
             nn.Linear(1, hidden_dim),
             act_fn
         ) for _ in range(input_dim)])
+        # Psi function combines all phi outputs
         self.psi_function = nn.Sequential(
             nn.Linear(input_dim * hidden_dim, hidden_dim),
             act_fn,
@@ -272,8 +326,12 @@ class KolmogorovArnoldExpert(nn.Module):
         self.apply(initialize_weights)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass through Kolmogorov-Arnold expert."""
+        # Apply each phi function to corresponding input dimension
         phi_outputs = [phi(x[:, i].unsqueeze(1)) for i, phi in enumerate(self.phi_functions)]
+        # Concatenate all phi outputs
         concatenated = torch.cat(phi_outputs, dim=1)
+        # Apply psi function
         return self.psi_function(concatenated)
 
 class MixtureOfExperts(nn.Module):
@@ -288,11 +346,14 @@ class MixtureOfExperts(nn.Module):
         activation: str = 'gelu'
     ):
         super(MixtureOfExperts, self).__init__()
+        # Create a list of LiquidLinear experts
         self.experts = nn.ModuleList([
             LiquidLinear(expert_dim, expert_dim, adapt_dim)
             for _ in range(num_experts)
         ])
+        # Add Kolmogorov-Arnold expert
         self.ka_expert = KolmogorovArnoldExpert(expert_dim, expert_dim, hidden_dim, activation=activation)
+        # Gating network to decide which expert to use
         self.gating = nn.Linear(adapt_dim, num_experts + 1)  # +1 for ka_expert
         self.drop_path = DropPath(drop_prob)
         self.num_experts = num_experts
@@ -300,16 +361,22 @@ class MixtureOfExperts(nn.Module):
         self.apply(initialize_weights)
 
     def forward(self, x: torch.Tensor, adapt_input: torch.Tensor) -> torch.Tensor:
+        """Forward pass through Mixture of Experts."""
+        # Compute gating scores
         gate_scores = F.softmax(self.gating(adapt_input), dim=-1)  # [batch_size, num_experts + 1]
         expert_outputs = []
+        # Compute outputs from each LiquidLinear expert
         for i, expert in enumerate(self.experts):
             expert_output = expert(x, adapt_input)  # [batch_size, expert_dim]
             expert_weight = gate_scores[:, i].unsqueeze(1)  # [batch_size, 1]
             expert_outputs.append(expert_weight * expert_output)
+        # Compute output from Kolmogorov-Arnold expert
         ka_output = self.ka_expert(x)  # [batch_size, expert_dim]
         ka_weight = gate_scores[:, -1].unsqueeze(1)  # [batch_size, 1]
         expert_outputs.append(ka_weight * ka_output)
+        # Sum all expert outputs
         output = sum(expert_outputs)  # [batch_size, expert_dim]
+        # Apply DropPath regularization
         output = self.drop_path(output)
         return output
 
@@ -330,6 +397,7 @@ class ComponentCombination(nn.Module):
         self.num_components = len(input_dims)
         self.fc1 = nn.Linear(sum(input_dims), hidden_dim)
         
+        # Choose activation function
         if activation == 'gelu':
             self.act1 = nn.GELU()
         elif activation == 'elu':
@@ -339,11 +407,13 @@ class ComponentCombination(nn.Module):
         else:
             raise ValueError(f"Unsupported activation: {activation}")
         
+        # Compute weights for each component
         self.fc2 = nn.Linear(hidden_dim, self.num_components)
         self.dropout = nn.Dropout(dropout_rate)
         self.softmax = nn.Softmax(dim=-1)
         self.residual_fc = nn.Linear(sum(input_dims), sum(input_dims))
         
+        # Choose normalization type
         if norm_type == 'batchnorm':
             self.norm = nn.BatchNorm1d(sum(input_dims))
         elif norm_type == 'groupnorm':
@@ -356,22 +426,31 @@ class ComponentCombination(nn.Module):
         self.apply(initialize_weights)
 
     def forward(self, component_outputs: List[torch.Tensor]) -> torch.Tensor:
+        """Forward pass to combine component outputs."""
+        # Check dimensions of each component output
         for i, (out, dim) in enumerate(zip(component_outputs, self.input_dims)):
             if out.shape[-1] != dim:
                 raise ValueError(f"Component {i} dimension mismatch: expected {dim}, got {out.shape[-1]}")
 
+        # Concatenate all component outputs
         concatenated = torch.cat(component_outputs, dim=-1)  # [batch, seq, sum(input_dims)]
+        # Apply normalization
         x = concatenated.permute(0, 2, 1)  # [batch, sum(input_dims), seq]
         x = self.norm(x)
         x = x.permute(0, 2, 1)  # [batch, seq, sum(input_dims)]
+        # Compute residual connection
         residual = self.residual_fc(concatenated)
+        # Pass through fully connected layers
         x = self.fc1(concatenated)
         x = self.act1(x)
         x = self.dropout(x)
+        # Compute weights for each component
         weights = self.fc2(x)  # [batch, seq, num_components]
         weights = self.softmax(weights)
         weights = weights.split(1, dim=-1)
+        # Combine weighted component outputs
         combined_output = sum(w * out for w, out in zip(weights, component_outputs))
+        # Add residual connection
         combined_output += residual
         return combined_output
 
@@ -399,9 +478,11 @@ class LFModel(nn.Module):
         dynamic_layer_threshold: float = 0.5
     ):
         super(LFModel, self).__init__()
+        # Featurizer to generate adaptive input
         self.featurizer = nn.Linear(token_dim, adapt_dim)
         self.featurizer.apply(initialize_weights)
 
+        # DropBlock regularization
         self.dropblock = DropBlock(block_size=dropblock_block_size, drop_prob=dropblock_prob)
         self.layers = nn.ModuleList()
         for i in range(num_layers):
@@ -431,6 +512,8 @@ class LFModel(nn.Module):
         self.output_layer.apply(initialize_weights)
 
     def forward(self, x: torch.Tensor, config_weights: Optional[Dict[str, float]] = None) -> torch.Tensor:
+        """Forward pass through the LFModel."""
+        # Generate adaptive input by averaging over sequence dimension
         adapt_input = self.featurizer(x.mean(dim=1))  # [batch, adapt_dim]
         if config_weights is None:
             config_weights = {f"layer_{i+1}": 1.0 for i in range(len(self.layers))}
@@ -439,18 +522,26 @@ class LFModel(nn.Module):
             layer_weight = config_weights.get(layer_key, 1.0)
             if layer_weight < self.dynamic_layer_threshold:
                 continue
+            # Apply LayerDrop with gradient checkpointing
             x = layer['layerdrop'](x, lambda x: self._process_layer(layer, x, adapt_input))
+        # Apply DropBlock regularization
         x = self.dropblock(x)
+        # Final output layer
         output = self.output_layer(x)
         return output
 
     def _process_layer(self, layer: nn.ModuleDict, x: torch.Tensor, adapt_input: torch.Tensor) -> torch.Tensor:
         """Processes a single layer with gradient checkpointing."""
         def custom_forward(x_inner, adapt_input_inner):
+            # Apply token mixer
             token_output = layer['token_mixer'](x_inner, adapt_input_inner)
+            # Apply channel mixer
             channel_output = layer['channel_mixer'](x_inner, adapt_input_inner)
+            # Apply Mixture of Experts
             moe_output = layer['moe'](x_inner, adapt_input_inner)
+            # Apply Longformer attention
             attention_output = layer['attention'](x_inner)[0]  # [batch, seq, hidden]
+            # Combine all component outputs
             component_outputs = [token_output, channel_output, moe_output, attention_output]
             combined_output = layer['combiner'](component_outputs)
             return combined_output
@@ -461,6 +552,7 @@ class AdaptiveConfiguration(nn.Module):
     """Generates adaptive configuration weights with reflection tuning."""
     def __init__(self, adapt_dim: int):
         super(AdaptiveConfiguration, self).__init__()
+        # Configuration network to generate initial weights
         self.config_net = nn.Sequential(
             nn.Linear(adapt_dim, 256),
             nn.GELU(),
@@ -469,6 +561,7 @@ class AdaptiveConfiguration(nn.Module):
             nn.Linear(128, 4)
         )
         self.apply(initialize_weights)
+        # Reflection network to adjust weights
         self.reflection_net = nn.Sequential(
             nn.Linear(4, 128),
             nn.GELU(),
@@ -477,10 +570,14 @@ class AdaptiveConfiguration(nn.Module):
         self.apply(initialize_weights)
 
     def forward(self, adapt_input: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Forward pass to generate adaptive configuration weights."""
+        # Generate initial configuration
         config = self.config_net(adapt_input)  # [batch, 4]
         config = F.softmax(config, dim=-1)
+        # Apply reflection tuning
         reflection = self.reflection_net(config)
         reflection = torch.sigmoid(reflection)
+        # Adjust configuration weights
         adjusted_config = config * reflection
         adjusted_config = F.softmax(adjusted_config, dim=-1)
         return {
@@ -514,6 +611,7 @@ class OmniModalLLM(nn.Module):
         dynamic_layer_threshold: float = 0.5
     ):
         super(OmniModalLLM, self).__init__()
+        # Initialize LFModel
         self.lf_model = LFModel(
             token_dim=token_dim,
             channel_dim=channel_dim,
@@ -533,29 +631,44 @@ class OmniModalLLM(nn.Module):
             norm_type=norm_type,
             dynamic_layer_threshold=dynamic_layer_threshold
         )
+        # Initialize LiquidVAE
         self.liquid_vae = LiquidVAE(input_dim=512, hidden_dim=256, latent_dim=128, adapt_dim=adapt_dim)
+        # Initialize Adaptive Configuration
         self.adaptive_config = AdaptiveConfiguration(adapt_dim)
+        # Token predictor to generate logits over vocabulary
         self.token_predictor = nn.Linear(512, self.lf_model.layers[0]['attention'].config.vocab_size)
         self.token_predictor.apply(initialize_weights)
 
     def forward(self, text_embeddings: torch.Tensor, image_embeddings: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Forward pass through the OmniModalLLM."""
+        # Concatenate text and image embeddings along sequence dimension
         combined_input = torch.cat([text_embeddings, image_embeddings], dim=1)  # [batch, seq+img_seq, embed_dim]
+        # Generate adaptive input by averaging over sequence dimension
         adapt_input = combined_input.mean(dim=1)  # [batch, adapt_dim]
+        # Generate adaptive configuration weights
         config = self.adaptive_config(self.lf_model.featurizer(adapt_input))
+        # Create config_weights dictionary for LFModel
         config_weights = {f"layer_{i+1}": weight.item() for i, weight in enumerate([
             config['moe_weight'], 
             config['token_mixer_weight'], 
             config['channel_mixer_weight'], 
             config['attention_weight']
         ])}
+        # Pass through LFModel
         output = self.lf_model(combined_input, config_weights)  # [batch, total_seq, token_dim]
+        # Split output into text and image parts
         seq_length = text_embeddings.shape[1]
         text_output = output[:, :seq_length, :]  # [batch, seq, token_dim]
+        # Compute mean of text output for VAE
         text_mean = text_output.mean(dim=1)  # [batch, token_dim]
+        # Pass through LiquidVAE
         vae_outputs = self.liquid_vae(text_mean, adapt_input)
         reconstructed_text = vae_outputs["reconstructed"]  # [batch, token_dim]
+        # Generate token logits
         token_logits = self.token_predictor(reconstructed_text)  # [batch, vocab_size]
+        # Reconstruct full text using VAE decoder
         reconstructed_text_full = self.liquid_vae.decoder(vae_outputs["reconstructed"], adapt_input)  # [batch, input_dim]
+        # Concatenate reconstructed text with image outputs
         combined_output = torch.cat([reconstructed_text_full.unsqueeze(1), output[:, seq_length:, :]], dim=1)  # [batch, total_seq, token_dim]
         return {
             "output": combined_output,
@@ -576,34 +689,43 @@ class OmniModalLLM(nn.Module):
         self.to(self.device)
         print(f"Model loaded from {path}")
 
-# Dummy VQVAE Implementation (Replace with actual implementation)
+# Vector Quantized VAE (VQVAE) Implementation
 class VQVAE(nn.Module):
-    """Dummy VQVAE for image tokenization. Replace with actual implementation."""
-    def __init__(self):
+    """Vector Quantized Variational Autoencoder (VQVAE) for image tokenization."""
+    def __init__(self, num_embeddings: int = 512, embedding_dim: int = 64, commitment_cost: float = 0.25):
         super(VQVAE, self).__init__()
-        # Simple encoder and decoder for demonstration
+        self.embedding_dim = embedding_dim
+        self.num_embeddings = num_embeddings
+        self.commitment_cost = commitment_cost
+
+        # Encoder network
         self.encoder = nn.Sequential(
-            nn.Conv2d(3, 64, kernel_size=4, stride=2, padding=1),  # [B, 64, 64, 64]
+            nn.Conv2d(3, 128, kernel_size=4, stride=2, padding=1),  # [B, 128, 64, 64]
             nn.ReLU(),
-            nn.Conv2d(64, 128, kernel_size=4, stride=2, padding=1),  # [B, 128, 32, 32]
+            nn.Conv2d(128, 256, kernel_size=4, stride=2, padding=1),  # [B, 256, 32, 32]
             nn.ReLU(),
-            nn.Conv2d(128, 64, kernel_size=3, stride=1, padding=1)  # [B, 64, 32, 32]
+            nn.Conv2d(256, embedding_dim, kernel_size=3, stride=1, padding=1)  # [B, embedding_dim, 32, 32]
         )
+
+        # Vector Quantizer
+        self.vq_layer = VectorQuantizer(num_embeddings, embedding_dim, commitment_cost)
+
+        # Decoder network
         self.decoder = nn.Sequential(
-            nn.ConvTranspose2d(64, 128, kernel_size=4, stride=2, padding=1),  # [B, 128, 64, 64]
+            nn.ConvTranspose2d(embedding_dim, 256, kernel_size=4, stride=2, padding=1),  # [B, 256, 64, 64]
             nn.ReLU(),
-            nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1),  # [B, 64, 128, 128]
+            nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1),  # [B, 128, 128, 128]
             nn.ReLU(),
-            nn.Conv2d(64, 3, kernel_size=3, stride=1, padding=1),  # [B, 3, 128, 128]
+            nn.Conv2d(128, 3, kernel_size=3, stride=1, padding=1),  # [B, 3, 128, 128]
             nn.Sigmoid()
         )
-        self.apply(initialize_weights)
 
     def forward(self, x: torch.Tensor):
-        encoded = self.encoder(x)
-        quantized = encoded  # Placeholder for actual quantization
-        decoded = self.decoder(quantized)
-        return quantized, encoded, decoded
+        """Forward pass through VQVAE."""
+        z_e = self.encoder(x)  # Encode input
+        z_q, vq_loss, perplexity = self.vq_layer(z_e)  # Vector quantization
+        x_recon = self.decoder(z_q)  # Reconstruct input
+        return z_q, vq_loss, perplexity
 
 # Dataset Class
 class CocoDataset(Dataset):
@@ -617,6 +739,7 @@ class CocoDataset(Dataset):
         return len(self.dataset)
 
     def __getitem__(self, idx):
+        """Get a single sample from the dataset."""
         sample = self.dataset[idx]
         text = sample['caption']
         image = sample['image']
@@ -640,7 +763,7 @@ def train_model(model, dataloader, optimizer, criterion, scheduler, device, num_
             text_embeddings = batch['text'].to(device)  # [batch, seq, embed_dim]
             image_embeddings = batch['image'].to(device)  # [batch, 3, 128, 128]
             # Tokenize image
-            image_tokens = model.adaptive_config(self.lf_model.featurizer(
+            image_tokens = model.adaptive_config(model.lf_model.featurizer(
                 torch.cat([
                     text_embeddings.mean(dim=1),
                     F.adaptive_avg_pool2d(image_embeddings, (1,1)).view(text_embeddings.shape[0], -1)
@@ -650,13 +773,16 @@ def train_model(model, dataloader, optimizer, criterion, scheduler, device, num_
             with autocast():
                 outputs = model(text_embeddings, image_embeddings)
                 token_logits = outputs["token_logits"]  # [batch, vocab_size]
+                # Assuming labels are next tokens in sequence
                 labels = text_embeddings[:, 1:, :].argmax(dim=-1).reshape(-1)  # [batch*(seq-1)]
                 token_logits = token_logits.reshape(-1, model.token_predictor.out_features)  # [batch*(seq-1), vocab_size]
                 loss_tokens = criterion(token_logits, labels)
+                # VAE loss
                 vae_recon = outputs["vae_reconstructed"]  # [batch, token_dim]
                 vae_mu = outputs["vae_mu"]
                 vae_logvar = outputs["vae_logvar"]
                 loss_vae = model.liquid_vae.loss_function(vae_recon, text_embeddings.mean(dim=1), vae_mu, vae_logvar)
+                # Total loss
                 loss = loss_tokens + loss_vae
             scaler.scale(loss).backward()
             scaler.step(optimizer)
@@ -685,6 +811,7 @@ def train_model(model, dataloader, optimizer, criterion, scheduler, device, num_
 
 # API Models
 class InferenceRequest(BaseModel):
+    """Model for inference request."""
     text: str
 
 # FastAPI Setup
@@ -692,6 +819,7 @@ app = FastAPI()
 
 # Initialize Model and Tokenizer (Load pre-trained or trained model)
 def initialize_model(device: str = 'cpu') -> (OmniModalLLM, LiquidFoundationTokenizer):
+    """Initialize the OmniModalLLM and tokenizer."""
     token_dim = 512
     channel_dim = 512
     expert_dim = 512
@@ -734,11 +862,16 @@ def generate_response(model: OmniModalLLM, tokenizer: LiquidFoundationTokenizer,
     """Generate response from the model based on input text and image."""
     model.eval()
     with torch.no_grad():
+        # Tokenize text
         text_emb = tokenizer.text_tokenizer.tokenize(text).to(device)  # [1, seq, embed_dim]
-        image_emb = tokenizer.image_tokenizer.tokenize(image).to(device)  # [1, 3, 128, 128]
+        # Tokenize image
+        image_emb = tokenizer.image_tokenizer.tokenize(image).to(device)  # [1, img_seq, embed_dim]
+        # Pass through model
         outputs = model(text_emb, image_emb)
         token_logits = outputs["token_logits"]  # [1, vocab_size]
+        # Get predicted token
         predictions = torch.argmax(token_logits, dim=-1)  # [1]
+        # Detokenize to get response text
         response_text = tokenizer.text_tokenizer.detokenize(predictions.unsqueeze(0))
     return response_text
 
@@ -749,22 +882,29 @@ async def generate(
     image: UploadFile = File(...)
 ):
     """API endpoint to generate response based on text and image."""
+    # Read and process image
     image_bytes = await image.read()
     image = Image.open(io.BytesIO(image_bytes)).convert('RGB')
+    # Generate response
     response = generate_response(model, tokenizer, text, image)
     return {"response": response}
 
 # Main Function to Train and Launch API
 def main():
+    """Main function to train the model and launch the API server."""
     # Data Loading and Preparation
     print("Loading MS COCO dataset...")
     dataset = load_dataset("coco_captions", "2017", split='train')
+    # Filter out samples without captions or images
     dataset = dataset.filter(lambda x: len(x['caption']) > 0 and x['image'] is not None)
+    # Define image transformations
     transform = transforms.Compose([
         transforms.Resize((128, 128)),
         transforms.ToTensor()
     ])
+    # Create custom dataset
     coco_dataset = CocoDataset(dataset, tokenizer.text_tokenizer, transform)
+    # Create DataLoader
     dataloader = DataLoader(coco_dataset, batch_size=8, shuffle=True, num_workers=2)
 
     # Optimizer, Loss, Scheduler
