@@ -1075,7 +1075,7 @@ def main():
     """Main function to train the model and launch the API server."""
     # Data Loading and Preparation
     print("Loading MS COCO dataset...")
-    dataset = load_dataset("coco_captions", "2017", split='train')
+    dataset = load_dataset("flickr30k", split='train')
     # Filter out samples without captions or images
     dataset = dataset.filter(lambda x: len(x['caption']) > 0 and x['image'] is not None)
     # Define image transformations
